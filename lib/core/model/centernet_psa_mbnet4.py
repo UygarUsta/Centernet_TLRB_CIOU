@@ -136,7 +136,7 @@ class CenterNetHead(nn.Module):
         cls = self.cls(inputs).sigmoid_()
         wh = self.wh(inputs)
         offset = self.offset(inputs)
-        iou = self.iou(inputs)
+        iou = self.iou(inputs).sigmoid_().squeeze(1)
         return cls, offset, wh, iou
 
 class CenterNet(nn.Module):

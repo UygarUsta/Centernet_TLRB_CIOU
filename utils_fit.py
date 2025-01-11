@@ -9,12 +9,63 @@ from calc_coco_val import calculate_eval
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+def decode_offsets_to_boxes(pred_offsets, stride=4):
+    """
+    pred_offsets: shape [B, H, W, 4]
+                  storing [left, top, right, bottom] per pixel
+    stride      : how many pixels in the input space per 1 step in the feature map
+
+    Returns:
+        decoded_boxes: shape [B, H, W, 4], with absolute corners in [x_min, y_min, x_max, y_max]
+    """
+    B, H, W, _ = pred_offsets.shape
+
+    # 1) Create a grid of center coords in the original input space
+    #    For pixel (y, x) in feature map, the "center" in input space is (x * stride, y * stride).
+    #    We'll flatten them, then reshape back.
+    device = pred_offsets.device
+    yv, xv = torch.meshgrid(
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32)
+    )
+    xv = xv * stride  # shape (H, W)
+    yv = yv * stride
+
+    # 2) Flatten
+    xv = xv.view(1, -1)  # shape (1, H*W)
+    yv = yv.view(1, -1)
+
+    # 3) Flatten the offsets
+    offsets_flat = pred_offsets.view(B, -1, 4)  # (B, H*W, 4)
+    # L, T, R, B
+    left_offset   = offsets_flat[..., 0]
+    top_offset    = offsets_flat[..., 1]
+    right_offset  = offsets_flat[..., 2]
+    bottom_offset = offsets_flat[..., 3]
+
+    # 4) For each pixel i,
+    #    x_min = center_x - (left_offset_i * stride)
+    #    x_max = center_x + (right_offset_i * stride)
+    #    y_min = center_y - (top_offset_i  * stride)
+    #    y_max = center_y + (bottom_offset_i * stride)
+    x_min = xv - left_offset  * stride
+    x_max = xv + right_offset * stride
+    y_min = yv - top_offset   * stride
+    y_max = yv + bottom_offset* stride
+
+    # 5) Combine into [x_min, y_min, x_max, y_max]
+    decoded = torch.stack([x_min, y_min, x_max, y_max], dim=-1)  # (B, H*W, 4)
+
+    # 6) Reshape back to (B, H, W, 4)
+    decoded = decoded.view(B, H, W, 4)
+    return decoded
+
 def fit_one_epoch(model_train, model,optimizer, epoch, epoch_step, epoch_step_val, gen, gen_val, Epoch, cuda, fp16, scaler, save_period, cocoGt,classes,folder,best_mean_AP,local_rank=0):
     total_r_loss    = 0
     total_c_loss    = 0
     total_loss      = 0
     val_loss        = 0
-    total_iou_aware_loss = 0
+    #total_iou_aware_loss = 0
 
     if local_rank == 0:
         print('Start Train')
@@ -26,17 +77,17 @@ def fit_one_epoch(model_train, model,optimizer, epoch, epoch_step, epoch_step_va
         with torch.no_grad():
             if cuda:
                 batch = [ann.cuda(local_rank) for ann in batch]
-        batch_images, batch_hms, batch_whs, batch_regs, batch_reg_masks = batch
+        batch_images, batch_hms, batch_regs, batch_reg_masks = batch
 
         #----------------------#
         #   清零梯度
         #----------------------#
         optimizer.zero_grad()
         if not fp16:
-            hm, wh, offset  = model_train(batch_images)
+            hm, pred_reg  = model_train(batch_images)
             c_loss          = focal_loss(hm, batch_hms)
-            wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
-            off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
+            # wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
+            # off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
             
             loss            = c_loss + wh_loss + off_loss
 
@@ -49,86 +100,50 @@ def fit_one_epoch(model_train, model,optimizer, epoch, epoch_step, epoch_step_va
         else:
             from torch.cuda.amp import autocast
             with autocast():
-                hm, wh, offset, iou_pred  = model_train(batch_images)
+                hm, pred_reg  = model_train(batch_images)
                 c_loss          = focal_loss(hm, batch_hms)
-                wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
-                off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
+                #wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
+                #off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
 
-                batch_size, _, grid_h, grid_w = hm.size()
-                device_type = "cuda"
+                pred_reg = pred_reg.permute(0, 2, 3, 1).contiguous()
 
-                # Create grid using meshgrid
-                grid_y, grid_x = torch.meshgrid(
-                    torch.arange(grid_h, device=device_type),
-                    torch.arange(grid_w, device=device_type)
-                )
-                grid_x = grid_x.float().unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-                grid_y = grid_y.float().unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-
-                # Compute center points
-                ct_x = grid_x + offset[:, 0:1, :, :]
-                ct_y = grid_y + offset[:, 1:2, :, :]
-                ct = torch.cat([ct_x, ct_y], dim=1)  # [B, 2, H, W]
-
-                # Compute bounding boxes
-                #wh = wh  # [B, 2, H, W]
-                x1 = ct[:, 0, :, :] - wh[:, 0, :, :] / 2
-                y1 = ct[:, 1, :, :] - wh[:, 1, :, :] / 2
-                x2 = ct[:, 0, :, :] + wh[:, 0, :, :] / 2
-                y2 = ct[:, 1, :, :] + wh[:, 1, :, :] / 2
-                pred_bboxes = torch.stack([x1, y1, x2, y2], dim=1)  # [B, 4, H, W]
-
-                batch_regs = batch_regs.permute(0,3,1,2)
-                batch_whs = batch_whs.permute(0,3,1,2)
-                # Ground truth bounding boxes
-                gt_wh = batch_whs  # [B, 2, H, W]
-                gt_ct_x = grid_x + batch_regs[:, 0:1, :, :]
-                gt_ct_y = grid_y + batch_regs[:, 1:2, :, :]
-                gt_x1 = gt_ct_x - gt_wh[:, 0:1, :, :] / 2
-                gt_y1 = gt_ct_y - gt_wh[:, 1:2, :, :] / 2
-                gt_x2 = gt_ct_x + gt_wh[:, 0:1, :, :] / 2
-                gt_y2 = gt_ct_y + gt_wh[:, 1:2, :, :] / 2
-                gt_bboxes = torch.stack([gt_x1, gt_y1, gt_x2, gt_y2], dim=1)  # [B, 4, H, W]
-                gt_bboxes = torch.squeeze(gt_bboxes,2)
-
-                # Reshape for CIoU loss
-                pred_bboxes = pred_bboxes.permute(0, 2, 3, 1).reshape(-1, 4)  # [B*H*W, 4]
-                gt_bboxes = gt_bboxes.permute(0, 2, 3, 1).reshape(-1, 4)      # [B*H*W, 4]
-                mask = batch_reg_masks.view(-1) > 0
+                pred_boxes = decode_offsets_to_boxes(pred_reg, stride=4)
+                gt_boxes = decode_offsets_to_boxes(batch_regs, stride=4) 
+                
 
                 # Compute CIoU loss
-                loss_ciou = ciou_loss(pred_bboxes, gt_bboxes, mask)
+                loss_ciou = ciou_loss(pred_boxes, gt_boxes, batch_reg_masks)
 
 
-                with torch.no_grad():
-                    inter_x1 = torch.max(pred_bboxes[:,0], gt_bboxes[:,0])
-                    inter_y1 = torch.max(pred_bboxes[:,1], gt_bboxes[:,1])
-                    inter_x2 = torch.min(pred_bboxes[:,2], gt_bboxes[:,2])
-                    inter_y2 = torch.min(pred_bboxes[:,3], gt_bboxes[:,3])
+                # with torch.no_grad():
+                #     inter_x1 = torch.max(pred_bboxes[:,0], gt_bboxes[:,0])
+                #     inter_y1 = torch.max(pred_bboxes[:,1], gt_bboxes[:,1])
+                #     inter_x2 = torch.min(pred_bboxes[:,2], gt_bboxes[:,2])
+                #     inter_y2 = torch.min(pred_bboxes[:,3], gt_bboxes[:,3])
 
-                    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-                    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-                    inter_area = inter_w * inter_h
+                #     inter_w = (inter_x2 - inter_x1).clamp(min=0)
+                #     inter_h = (inter_y2 - inter_y1).clamp(min=0)
+                #     inter_area = inter_w * inter_h
 
-                    area_pred = (pred_bboxes[:,2]-pred_bboxes[:,0]).clamp(min=0)*(pred_bboxes[:,3]-pred_bboxes[:,1]).clamp(min=0)
-                    area_gt = (gt_bboxes[:,2]-gt_bboxes[:,0]).clamp(min=0)*(gt_bboxes[:,3]-gt_bboxes[:,1]).clamp(min=0)
-                    union = area_pred + area_gt - inter_area + 1e-6
-                    actual_iou = inter_area / union  # shape: [N]
+                #     area_pred = (pred_bboxes[:,2]-pred_bboxes[:,0]).clamp(min=0)*(pred_bboxes[:,3]-pred_bboxes[:,1]).clamp(min=0)
+                #     area_gt = (gt_bboxes[:,2]-gt_bboxes[:,0]).clamp(min=0)*(gt_bboxes[:,3]-gt_bboxes[:,1]).clamp(min=0)
+                #     union = area_pred + area_gt - inter_area + 1e-6
+                #     actual_iou = inter_area / union  # shape: [N]
 
-                # iou_pred shape: [B, H, W], flatten -> [B*H*W]
-                iou_pred_flat = iou_pred.view(-1)
-                loss_iou_aware = iou_aware_loss(iou_pred_flat, actual_iou, mask)
+                # # iou_pred shape: [B, H, W], flatten -> [B*H*W]
+                # iou_pred_flat = iou_pred.view(-1)
+                # loss_iou_aware = iou_aware_loss(iou_pred_flat, actual_iou, mask)
 
 
 
 
                 
-                loss            = c_loss  + off_loss + loss_ciou + loss_iou_aware   # +wh_loss
+                loss            = c_loss   + loss_ciou * 5   # +wh_loss
 
                 total_loss      += loss.item()
                 total_c_loss    += c_loss.item()
-                total_r_loss    += loss_ciou.item() + off_loss.item() + loss_iou_aware.item() * 0.5  #wh_loss.item() + off_loss.item()
-                total_iou_aware_loss += loss_iou_aware.item()
+                total_r_loss    += loss_ciou.item() #+ off_loss.item() + loss_iou_aware.item() * 0.5  #wh_loss.item() + off_loss.item()
+                #total_iou_aware_loss += loss_iou_aware.item()
 
             #----------------------#
             #   反向传播
@@ -140,7 +155,6 @@ def fit_one_epoch(model_train, model,optimizer, epoch, epoch_step, epoch_step_va
         if local_rank == 0:
             pbar.set_postfix(**{'total_r_loss'  : total_r_loss / (iteration + 1), 
                                 'total_c_loss'  : total_c_loss / (iteration + 1),
-                                'total_iou_aware_loss' : total_iou_aware_loss / (iteration + 1),
                                 'lr'            : get_lr(optimizer)})
             pbar.update(1)
 
@@ -158,78 +172,40 @@ def fit_one_epoch(model_train, model,optimizer, epoch, epoch_step, epoch_step_va
         with torch.no_grad():
             if cuda:
                 batch = [ann.cuda(local_rank) for ann in batch]
-            batch_images, batch_hms, batch_whs, batch_regs, batch_reg_masks = batch
+            batch_images, batch_hms, batch_regs, batch_reg_masks = batch
 
-            hm, wh, offset,iou_pred  = model_train(batch_images)
+            hm, pred_reg  = model_train(batch_images)
             c_loss          = focal_loss(hm, batch_hms)
-            wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
-            off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
-
-            batch_size, _, grid_h, grid_w = hm.size()
-            device_type = "cuda"
-
-            # Create grid using meshgrid
-            grid_y, grid_x = torch.meshgrid(
-                torch.arange(grid_h, device=device_type),
-                torch.arange(grid_w, device=device_type)
-            )
-            grid_x = grid_x.float().unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-            grid_y = grid_y.float().unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-
-            # Compute center points
-            ct_x = grid_x + offset[:, 0:1, :, :]
-            ct_y = grid_y + offset[:, 1:2, :, :]
-            ct = torch.cat([ct_x, ct_y], dim=1)  # [B, 2, H, W]
-
-            # Compute bounding boxes
-            #wh = wh  # [B, 2, H, W]
-            x1 = ct[:, 0, :, :] - wh[:, 0, :, :] / 2
-            y1 = ct[:, 1, :, :] - wh[:, 1, :, :] / 2
-            x2 = ct[:, 0, :, :] + wh[:, 0, :, :] / 2
-            y2 = ct[:, 1, :, :] + wh[:, 1, :, :] / 2
-            pred_bboxes = torch.stack([x1, y1, x2, y2], dim=1)  # [B, 4, H, W]
-
-            batch_regs = batch_regs.permute(0,3,1,2)
-            batch_whs = batch_whs.permute(0,3,1,2)
-            # Ground truth bounding boxes
-            gt_wh = batch_whs  # [B, 2, H, W]
-            gt_ct_x = grid_x + batch_regs[:, 0:1, :, :]
-            gt_ct_y = grid_y + batch_regs[:, 1:2, :, :]
-            gt_x1 = gt_ct_x - gt_wh[:, 0:1, :, :] / 2
-            gt_y1 = gt_ct_y - gt_wh[:, 1:2, :, :] / 2
-            gt_x2 = gt_ct_x + gt_wh[:, 0:1, :, :] / 2
-            gt_y2 = gt_ct_y + gt_wh[:, 1:2, :, :] / 2
-            gt_bboxes = torch.stack([gt_x1, gt_y1, gt_x2, gt_y2], dim=1)  # [B, 4, H, W]
-            gt_bboxes = torch.squeeze(gt_bboxes,2)
-
-            # Reshape for CIoU loss
-            pred_bboxes = pred_bboxes.permute(0, 2, 3, 1).reshape(-1, 4)  # [B*H*W, 4]
-            gt_bboxes = gt_bboxes.permute(0, 2, 3, 1).reshape(-1, 4)      # [B*H*W, 4]
-            mask = batch_reg_masks.view(-1) > 0
+            #wh_loss         = 0.1 * reg_l1_loss(wh, batch_whs, batch_reg_masks)
+            #off_loss        = reg_l1_loss(offset, batch_regs, batch_reg_masks)
+            pred_reg = pred_reg.permute(0, 2, 3, 1).contiguous()
+            pred_boxes = decode_offsets_to_boxes(pred_reg, stride=4)
+            gt_boxes = decode_offsets_to_boxes(batch_regs, stride=4) 
+            
 
             # Compute CIoU loss
-            loss_ciou = ciou_loss(pred_bboxes, gt_bboxes, mask)
+            loss_ciou = ciou_loss(pred_boxes, gt_boxes, batch_reg_masks)
 
             
-            inter_x1 = torch.max(pred_bboxes[:,0], gt_bboxes[:,0])
-            inter_y1 = torch.max(pred_bboxes[:,1], gt_bboxes[:,1])
-            inter_x2 = torch.min(pred_bboxes[:,2], gt_bboxes[:,2])
-            inter_y2 = torch.min(pred_bboxes[:,3], gt_bboxes[:,3])
+            # inter_x1 = torch.max(pred_bboxes[:,0], gt_bboxes[:,0])
+            # inter_y1 = torch.max(pred_bboxes[:,1], gt_bboxes[:,1])
+            # inter_x2 = torch.min(pred_bboxes[:,2], gt_bboxes[:,2])
+            # inter_y2 = torch.min(pred_bboxes[:,3], gt_bboxes[:,3])
 
-            inter_w = (inter_x2 - inter_x1).clamp(min=0)
-            inter_h = (inter_y2 - inter_y1).clamp(min=0)
-            inter_area = inter_w * inter_h
+            # inter_w = (inter_x2 - inter_x1).clamp(min=0)
+            # inter_h = (inter_y2 - inter_y1).clamp(min=0)
+            # inter_area = inter_w * inter_h
 
-            area_pred = (pred_bboxes[:,2]-pred_bboxes[:,0]).clamp(min=0)*(pred_bboxes[:,3]-pred_bboxes[:,1]).clamp(min=0)
-            area_gt = (gt_bboxes[:,2]-gt_bboxes[:,0]).clamp(min=0)*(gt_bboxes[:,3]-gt_bboxes[:,1]).clamp(min=0)
-            union = area_pred + area_gt - inter_area + 1e-6
-            actual_iou = inter_area / union  # shape: [N]
+            # area_pred = (pred_bboxes[:,2]-pred_bboxes[:,0]).clamp(min=0)*(pred_bboxes[:,3]-pred_bboxes[:,1]).clamp(min=0)
+            # area_gt = (gt_bboxes[:,2]-gt_bboxes[:,0]).clamp(min=0)*(gt_bboxes[:,3]-gt_bboxes[:,1]).clamp(min=0)
+            # union = area_pred + area_gt - inter_area + 1e-6
+            # actual_iou = inter_area / union  # shape: [N]
 
-            # iou_pred shape: [B, H, W], flatten -> [B*H*W]
-            iou_pred_flat = iou_pred.view(-1)
-            loss_iou_aware = iou_aware_loss(iou_pred_flat, actual_iou, mask)
+            # # iou_pred shape: [B, H, W], flatten -> [B*H*W]
+            # iou_pred_flat = iou_pred.view(-1)
+            # loss_iou_aware = iou_aware_loss(iou_pred_flat, actual_iou, mask)
 
-            loss            = c_loss  + off_loss + loss_ciou + loss_iou_aware * 0.5 # +wh_loss
+            loss            = c_loss   + loss_ciou * 5  #+ loss_iou_aware * 0.5 # +wh_loss
 
             val_loss        += loss.item()
 

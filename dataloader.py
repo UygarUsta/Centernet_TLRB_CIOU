@@ -61,6 +61,12 @@ def preprocess_input(image):
     std     = [0.2886383, 0.27408165, 0.27809834]
     return (image / 255. - mean) / std
 
+def preprocess_input_simple(image):
+    image   = image[:, :, ::-1] #np.array(image,dtype = np.float32)[:, :, ::-1]
+    #mean    = [0.40789655, 0.44719303, 0.47026116]
+    #std     = [0.2886383, 0.27408165, 0.27809834]
+    return image / 255. #(image / 255. - mean) / std
+
 
 
 class CenternetDataset(Dataset):
@@ -88,15 +94,15 @@ class CenternetDataset(Dataset):
         image, box      = self.get_random_data(self.image_path[index],self.annotation_lines[index], self.input_shape, random = self.train)
 
         batch_hm        = np.zeros((self.output_shape[0], self.output_shape[1], self.num_classes), dtype=np.float32)
-        batch_wh        = np.zeros((self.output_shape[0], self.output_shape[1], 2), dtype=np.float32)
-        batch_reg       = np.zeros((self.output_shape[0], self.output_shape[1], 2), dtype=np.float32)
+        #batch_wh        = np.zeros((self.output_shape[0], self.output_shape[1], 2), dtype=np.float32)
+        batch_reg       = np.zeros((self.output_shape[0], self.output_shape[1], 4), dtype=np.float32)
         batch_reg_mask  = np.zeros((self.output_shape[0], self.output_shape[1]), dtype=np.float32)
-        
+        neighbor_size = 1
         if len(box) != 0:
             boxes = np.array(box[:, :4],dtype=np.float32)
             boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]] / self.input_shape[1] * self.output_shape[1], 0, self.output_shape[1] - 1)
             boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]] / self.input_shape[0] * self.output_shape[0], 0, self.output_shape[0] - 1)
-
+        H, W = batch_hm.shape[:2]
         for i in range(len(box)):
             bbox    = boxes[i].copy()
             cls_id  = int(box[i, -1])
@@ -110,26 +116,42 @@ class CenternetDataset(Dataset):
                 #-------------------------------------------------#
                 ct = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
                 ct_int = ct.astype(np.int32)
+                xmin,ymin,xmax,ymax = bbox[:4]
+                area = (1 / self.bbox_areas_log_np(bbox[:4])) * 2
                 #----------------------------#
                 #   绘制高斯热力图
                 #----------------------------#
                 batch_hm[:, :, cls_id] = draw_gaussian(batch_hm[:, :, cls_id], ct_int, radius)
-                #---------------------------------------------------#
-                #   计算宽高真实值
-                #---------------------------------------------------#
-                batch_wh[ct_int[1], ct_int[0]] = 1. * w, 1. * h
-                #---------------------------------------------------#
-                #   计算中心偏移量
-                #---------------------------------------------------#
-                batch_reg[ct_int[1], ct_int[0]] = ct - ct_int
-                #---------------------------------------------------#
-                #   将对应的mask设置为1
-                #---------------------------------------------------#
-                batch_reg_mask[ct_int[1], ct_int[0]] = 1
+                for dx in range(-neighbor_size, neighbor_size + 1):
+                    for dy in range(-neighbor_size, neighbor_size + 1):
+                        nx = ct_int[0] + dx
+                        ny = ct_int[1] + dy
+        
+                        if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                            continue
+        
+                        # tl = y_center - y_min  # Distance to top
+                        # tt = x_center - x_min  # Distance to left
+                        # br = y_max - y_center  # Distance to bottom
+                        # rr = x_max - x_center  # Distance to right
+                        adjusted_tlbr = [
+                            (nx - xmin),  # Distance from the grid cell to the left edge
+                            (ny - ymin),  # Distance from the grid cell to the top edge
+                            (xmax - nx),  # Distance from the grid cell to the right edge
+                            (ymax - ny)   # Distance from the grid cell to the bottom edge
+                        ]
+                        batch_reg[ny, nx] = adjusted_tlbr
+                        batch_hm[ny, nx, cls_id] = 1
+                        batch_reg_mask[ny, nx] = area
 
         image = np.transpose(preprocess_input(image), (2, 0, 1))
 
-        return image, batch_hm, batch_wh, batch_reg, batch_reg_mask
+        return image, batch_hm, batch_reg, batch_reg_mask
+    
+    def bbox_areas_log_np(self,bbox):
+        x_min, y_min, x_max, y_max = bbox[0], bbox[1], bbox[2], bbox[3]
+        area = (y_max - y_min + 1) * (x_max - x_min + 1)
+        return np.log(area) 
 
 
     def rand(self, a=0, b=1):
@@ -256,20 +278,20 @@ class CenternetDataset(Dataset):
 
 # DataLoader中collate_fn使用
 def centernet_dataset_collate(batch):
-    imgs, batch_hms, batch_whs, batch_regs, batch_reg_masks = [], [], [], [], []
+    imgs, batch_hms, batch_regs, batch_reg_masks = [], [], [], []
 
-    for img, batch_hm, batch_wh, batch_reg, batch_reg_mask in batch:
+    for img, batch_hm, batch_reg, batch_reg_mask in batch:
         imgs.append(img)
         batch_hms.append(batch_hm)
-        batch_whs.append(batch_wh)
+        #batch_whs.append(batch_wh)
         batch_regs.append(batch_reg)
         batch_reg_masks.append(batch_reg_mask)
 
     imgs            = torch.from_numpy(np.array(imgs)).type(torch.FloatTensor)
     batch_hms       = torch.from_numpy(np.array(batch_hms)).type(torch.FloatTensor)
-    batch_whs       = torch.from_numpy(np.array(batch_whs)).type(torch.FloatTensor)
+    #batch_whs       = torch.from_numpy(np.array(batch_whs)).type(torch.FloatTensor)
     batch_regs      = torch.from_numpy(np.array(batch_regs)).type(torch.FloatTensor)
     batch_reg_masks = torch.from_numpy(np.array(batch_reg_masks)).type(torch.FloatTensor)
-    return imgs, batch_hms, batch_whs, batch_regs, batch_reg_masks
+    return imgs, batch_hms, batch_regs, batch_reg_masks
 
 

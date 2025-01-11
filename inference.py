@@ -8,8 +8,10 @@ import os
 from CenternetPlus.centernet_plus import CenterNetPlus
 import time 
 
+# cv2.setNumThreads(0)
+# cv2.ocl.setUseOpenCL(False)
 
-video = True
+video = False
 half = False 
 cpu = False 
 trace = False 
@@ -27,7 +29,7 @@ print(classes)
 input_height = 512
 input_width = 512
 
-folder = "/home/rivian/Desktop/Datasets/derpetv5_xml/val_images" #r"G:\COCO\val2017" #"E:/derpetv5_xml" #"/home/rivian/Desktop/Datasets/derpet_v4_label_tf" #"/home/rivian/Desktop/Datasets/coco_mini_train"
+folder =  "/home/rivian/Desktop/Datasets/derpetv5_xml/val_images" #"/mnt/g/COCO_vehicles/val_images" #r"G:\COCO\val2017" #"E:/derpetv5_xml" #"/home/rivian/Desktop/Datasets/derpet_v4_label_tf" #"/home/rivian/Desktop/Datasets/coco_mini_train"
 #folder = os.path.join(folder,"val_images") #place to val
 #video_path = r"E:\ESHOT 2024\Geshot Gediz 2 Garaji Gorselleri\Videolar\Otokar Ters Depo.avi"
 video_path = "/home/rivian/Desktop/17_2022-11-09-14.26.56_derpet-converted.mp4" #0 #r"G:\8_2023-07-31-11.37.01_novis_output.avi"
@@ -38,6 +40,7 @@ model_type = "shufflenet"
 
 
 if model_type == "shufflenet":
+    #from lib.core.model.centernet_psa_mbnet4 import CenterNet
     from lib.core.model.centernet import CenterNet
     conf = 0.25
     model = CenterNet(nc=len(classes))
@@ -144,7 +147,7 @@ if video:
         #img = cv2.resize(img,(1280,720))
         img = img[...,::-1]
         image,annos = infer_image(model,img,classes,conf,half,input_shape=(input_height,input_width),cpu=cpu,openvino_exp=openvino_exp)
-        image = cv2.resize(image,(1280,720))
+        #image = cv2.resize(image,(1280,720))
         #print(annos)
         cv2.imshow("ciou_iou_aware_centernet",image[...,::-1])
         ch = cv2.waitKey(1)
@@ -166,7 +169,8 @@ else:
                 ymax = b[3]
                 class_ = b[4]
                 annotations.append([xmin,ymin,xmax,ymax,class_])
-        image = cv2.resize(image,(1280,720))
+        if image.shape[1] > 1280: 
+            image = cv2.resize(image,(1280,720))
         cv2.imshow("ciou_iou_aware_centernet",image[...,::-1])
         ch = cv2.waitKey(0)
         if ch == ord("q"): break

@@ -1,7 +1,7 @@
 import torch 
 import numpy as np
-from dataloader import preprocess_input,resize_image,cvtColor,resize_numpy
-from utils_bbox import decode_bbox,postprocess
+from dataloader import preprocess_input,resize_image,cvtColor,resize_numpy,preprocess_input_simple
+from utils_bbox import decode_bbox,postprocess,centernet_correct_boxes_xyxy
 from PIL import Image 
 import cv2 
 import time 
@@ -49,9 +49,10 @@ def infer_image(model,img,classes,confidence=0.05,half=False,input_shape = (512,
     image  = cvtColor(image)
     #image_data = resize_image(image,tuple(input_shape),letterbox_image=True) 
     image_data = resize_numpy(image,tuple(input_shape),letterbox_image=False)
-
+    #image_data = cv2.resize(image, tuple(input_shape), interpolation=cv2.INTER_CUBIC)
 
     image_data = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+    #image_data = np.expand_dims(np.transpose(preprocess_input_simple(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
     
     lf = max(round(sum(image_shape) / 2 * 0.003), 2) #rectangle thickness
     tf = max(lf - 1, 1)  # font thickness
@@ -61,59 +62,58 @@ def infer_image(model,img,classes,confidence=0.05,half=False,input_shape = (512,
     print(f"Preprocessing took: {fpre - fps1} ms")
     box_annos = []
     try:
-        f1 = time.time()
-        with torch.no_grad():
-            images = torch.from_numpy(np.asarray(image_data)).type(torch.FloatTensor).to(device)
-            if half: images = images.half()
-            if not openvino_exp:
-              hm,wh,offset,iou_pred = model(images)
-            if openvino_exp:
-               output = model(images) # hm,wh,offset
-               hm = torch.tensor(output[0])
-               wh = torch.tensor(output[1])
-               offset = torch.tensor(output[2])
-               iou_pred = torch.tensor(output[3])
-        if half: 
-            hm  = hm.half()
-            wh = wh.half()
-            offset = offset.half()
-            iou_pred = iou_pred.half()
-        f2 = time.time()
-        print(f"Model inference time: {f2-f1} ms")
+      f1 = time.time()
+      with torch.no_grad():
+          images = torch.from_numpy(np.asarray(image_data)).type(torch.FloatTensor).to(device)
+          if half: images = images.half()
+          if not openvino_exp:
+            hm,wh = model(images)
+          if openvino_exp:
+              output = model(images) # hm,wh,offset
+              hm = torch.tensor(output[0])
+              wh = torch.tensor(output[1])
+            #  offset = torch.tensor(output[2])
+            #  iou_pred = torch.tensor(output[3])
+      if half: 
+          hm  = hm.half()
+          wh = wh.half()
+          #offset = offset.half()
+          #iou_pred = iou_pred.half()
+      f2 = time.time()
+      print(f"Model inference time: {f2-f1} ms")
 
-        fp1 = time.time()
+      fp1 = time.time()
+      outputs = decode_bbox(hm,wh,stride = 4,confidence=confidence,cuda=cuda)
+      
+      results = centernet_correct_boxes_xyxy(outputs,input_shape, image_shape, False).cpu()
+      #results = outputs[0].cpu().numpy()
+      #results = postprocess(outputs,True,image_shape,input_shape, False, 0.3) #letterbox true
 
-        outputs = decode_bbox(hm,wh,offset,iou_pred,confidence=confidence,cuda=cuda)
-        results = postprocess(outputs,True,image_shape,input_shape, False, 0.3) #letterbox true
+      fp2 = time.time()
+      print(f"Postprocessing took: {fp2-fp1} ms")
 
-        fp2 = time.time()
-        print(f"Postprocessing took: {fp2-fp1} ms")
-        top_label   = np.array(results[0][:, 5], dtype = 'int32')
-        top_conf    = results[0][:, 4]
-        top_boxes   = results[0][:, :4]
-        for (conf,label,box) in zip(top_conf,top_label,top_boxes):
-            ymin = box[0]
-            xmin = box[1] 
-            ymax = box[2] 
-            xmax = box[3] 
+      for det in results:
+        xmin = int(det[0])
+        ymin = int(det[1])
+        xmax = int(det[2])
+        ymax = int(det[3])
+        conf = float(det[4])
+        label = int(det[5])
+        class_label = label
+        box = [ymin,xmin,ymax,xmax]
+        name = f'{classes[class_label]} {conf:.2f}'
+        box_annos.append([xmin,ymin,xmax,ymax,str(name),conf])
 
-            xmin = int(xmin)
-            ymin = int(ymin)
-            xmax = int(xmax)
-            ymax = int(ymax)
-            class_label = label
-            name = f'{classes[class_label]} {conf:.2f}'
-            box_annos.append([xmin,ymin,xmax,ymax,str(name),conf])
+        p1, p2 = (int(box[1]), int(box[0])), (int(box[3]), int(box[2]))
+        w, h = cv2.getTextSize(name, 0, fontScale=lf / 3, thickness=tf)[0]  # text width, height
+        outside = p1[1] - h >= 3
+        p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
+        cv2.rectangle(image, p1, p2, colors(class_label, True), -1, cv2.LINE_AA)  # filled
 
-            p1, p2 = (int(box[1]), int(box[0])), (int(box[3]), int(box[2]))
-            w, h = cv2.getTextSize(name, 0, fontScale=lf / 3, thickness=tf)[0]  # text width, height
-            outside = p1[1] - h >= 3
-            p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
-            cv2.rectangle(image, p1, p2, colors(class_label, True), -1, cv2.LINE_AA)  # filled
-
-            cv2.rectangle(image,(xmin,ymin),(xmax,ymax),colors(class_label, True),lf) #(0,255,0)
-            cv2.putText(image,str(name),(p1[0], p1[1] - 2 if outside else p1[1] + h + 2),cv2.FONT_HERSHEY_COMPLEX,1,(255,255,255),tf) #(255,0,255)
-            #cv2.putText(image,str(conf),(p1[0], p1[1] - 2 if outside else p1[1] + h + 2),cv2.FONT_HERSHEY_COMPLEX,1,(255,255,255),tf)
+        cv2.rectangle(image,(xmin,ymin),(xmax,ymax),colors(class_label, True),lf) #(0,255,0)
+        #cv2.rectangle(image,(xmin,ymin),(xmax,ymax),colors(class_label, True),1) #(0,255,0)
+        cv2.putText(image,str(name),(p1[0], p1[1] - 2 if outside else p1[1] + h + 2),cv2.FONT_HERSHEY_COMPLEX,1,(255,255,255),tf) #(255,0,255)
+        #cv2.putText(image,str(conf),(p1[0], p1[1] - 2 if outside else p1[1] + h + 2),cv2.FONT_HERSHEY_COMPLEX,1,(255,255,255),tf)
 
             
     except Exception as e:

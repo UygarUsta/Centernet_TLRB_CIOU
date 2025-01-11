@@ -25,11 +25,11 @@ from infer_utils import load_model,hardnet_load_model
 #from dlamodel import get_pose_net
 #from centernet_resnet import resnet_18
 
-folder = "/home/rivian/Desktop/Datasets/coco_mini_train"
+folder = "/home/rivian/Desktop/Datasets/derpetv5_xml"
 
 input_shape = (512,512)
 batch_size = 8#16
-epochs = 100
+epochs = 200
 num_workers = 8
 optimizer_type = "adam"
 lr_decay_type = "cos"
@@ -60,10 +60,10 @@ with open("classes.txt","w") as f:
 
 pretrained = True
 model_type = "shufflenet"
-model_path = "best_epoch_weights_mbv2_shufflenet_cocomini.pth"
+model_path = "centernet_mobilenetv2_stride4.pth" #"best_epoch_weights_ciou_iou_aware_mbv4_psa_shufflenet_coco_mini_map_117.pth"
 
 if model_type == "shufflenet":
-    from lib.core.model.centernet_psa_mbnet4 import CenterNet
+    from lib.core.model.centernet import CenterNet
     model = CenterNet(nc=len(classes))
     if model_path != "":
         model = load_model(model,model_path)
@@ -191,6 +191,14 @@ gen_val = DataLoader(val_dataset  , shuffle = True, batch_size = batch_size, num
                                     drop_last=True, collate_fn=centernet_dataset_collate, sampler=val_sampler,
                                     worker_init_fn=partial(worker_init_fn, rank=rank, seed=seed))
 
+# for i in range(30):
+#     img, hm,wh,regmask = train_dataset[i]
+
+#     img_visualize = gt_check(img,hm,wh)
+#     cv2.imshow("img",img_visualize)
+#     ch = cv2.waitKey(0)
+#     if ch == ord("q"): break 
+
 save_period = 5
 best_mean_AP = 0
 for epoch in range(epochs):
@@ -204,9 +212,9 @@ print("Best Mean AP:",best_mean_AP)
 
 ##sanity check
 # for i in range(30):
-#     img, hm,wh,offset,regmask = train_dataset[i]
+#     img, hm,wh,regmask = train_dataset[i]
 
-#     img_visualize = gt_check(img,hm,wh,offset)
+#     img_visualize = gt_check(img,hm,wh)
 #     plt.imshow(img_visualize)
 #     plt.imshow(cv2.resize(hm[:,:,0],(img_visualize.shape[1],img_visualize.shape[0])),cmap="jet",alpha=0.4)
 #     plt.show()

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 from torchvision.ops import nms
-
+import sys,os
 
 def pool_nms(heat, kernel = 3):
     pad = (kernel - 1) // 2
@@ -14,7 +14,7 @@ def pool_nms(heat, kernel = 3):
 
 
 
-def decode_bbox(pred_hms, pred_whs, pred_offsets,pred_ious, confidence=0.3, cuda=True):
+def decode_bbox(pred_hms, pred_reg,stride=4,confidence=0.3, cuda=True):
     #-------------------------------------------------------------------------#
     #   当利用512x512x3图片进行coco数据集预测的时候
     #   h = w = 128 num_classes = 80
@@ -37,18 +37,18 @@ def decode_bbox(pred_hms, pred_whs, pred_offsets,pred_ious, confidence=0.3, cuda
         #   pred_offset     128*128, 2              特征点的xy轴偏移情况
         #-------------------------------------------------------------------------#
         heat_map    = pred_hms[batch].permute(1, 2, 0).view([-1, c])
-        pred_wh     = pred_whs[batch].permute(1, 2, 0).view([-1, 2])
-        pred_offset = pred_offsets[batch].permute(1, 2, 0).view([-1, 2])
+        pred_reg     = pred_reg[batch].permute(1, 2, 0).view([-1, 4])
+        #pred_offset = pred_offsets[batch].permute(1, 2, 0).view([-1, 2])
 
-        if pred_ious is not None:
-            # shape could be [b, H, W] or [b, 1, H, W]
-            iou_map = pred_ious[batch]
-            if iou_map.dim() == 3 and iou_map.shape[0] == 1:
-                iou_map = iou_map.squeeze(0)  
-            # Now iou_map is [H, W]
-            iou_map = iou_map.view(-1)  # flatten to [H*W]
-        else:
-            iou_map = None
+        # if pred_ious is not None:
+        #     # shape could be [b, H, W] or [b, 1, H, W]
+        #     iou_map = pred_ious[batch]
+        #     if iou_map.dim() == 3 and iou_map.shape[0] == 1:
+        #         iou_map = iou_map.squeeze(0)  
+        #     # Now iou_map is [H, W]
+        #     iou_map = iou_map.view(-1)  # flatten to [H*W]
+        # else:
+        #     iou_map = None
 
         yv, xv      = torch.meshgrid(torch.arange(0, output_h), torch.arange(0, output_w))
         #-------------------------------------------------------------------------#
@@ -67,42 +67,126 @@ def decode_bbox(pred_hms, pred_whs, pred_offsets,pred_ious, confidence=0.3, cuda
         class_conf, class_pred  = torch.max(heat_map, dim = -1)
         mask                    = class_conf > confidence
 
-        #-----------------------------------------#
-        #   取出得分筛选后对应的结果
-        #-----------------------------------------#
-        pred_wh_mask        = pred_wh[mask]
-        pred_offset_mask    = pred_offset[mask]
-        if len(pred_wh_mask) == 0:
-            detects.append([])
-            continue     
+        pred_reg_mask = pred_reg[mask]  # shape: (M, 4)
+        scores_mask    = class_conf[mask]
+        classes_mask   = class_pred[mask]
+        
+        try:
+            if len(pred_reg_mask) == 0:
+                detects.append([])
+                continue    
 
-        #----------------------------------------#
-        #   计算调整后预测框的中心
-        #----------------------------------------#
-        xv_mask = torch.unsqueeze(xv[mask] + pred_offset_mask[..., 0], -1)
-        yv_mask = torch.unsqueeze(yv[mask] + pred_offset_mask[..., 1], -1)
-        #----------------------------------------#
-        #   计算预测框的宽高
-        #----------------------------------------#
-        half_w, half_h = pred_wh_mask[..., 0:1] / 2, pred_wh_mask[..., 1:2] / 2
+            
+            #-----------------------------------------#
+            #   取出得分筛选后对应的结果
+            #-----------------------------------------#
+            left_offset   = pred_reg_mask[:, 0]
+            top_offset    = pred_reg_mask[:, 1]
+            right_offset  = pred_reg_mask[:, 2]
+            bottom_offset = pred_reg_mask[:, 3]
+            
+
+            #----------------------------------------#
+            #   计算调整后预测框的中心
+            #----------------------------------------#
+            x_center = xv[mask] * stride
+            y_center = yv[mask] * stride
+
+            # Now compute x_min, y_min, x_max, y_max
+            x_min = x_center - left_offset   * stride
+            y_min = y_center - top_offset    * stride
+            x_max = x_center + right_offset  * stride
+            y_max = y_center + bottom_offset * stride
+
+            bboxes  = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+            scores  = scores_mask.unsqueeze(-1)
+            c_ids   = classes_mask.float().unsqueeze(-1)
+
+            detect = torch.cat([bboxes, scores, c_ids], dim=-1)  # shape: (M, 6)
+            all_detections = detect
+        
+            # NMS on CPU or GPU
+            keep_indices = nms(all_detections[:, :4], all_detections[:, 4], 0.35)
+            final_dets   = all_detections[keep_indices]
+            detects.append(final_dets)
+        except Exception as e:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            print(exc_type, fname, exc_tb.tb_lineno)
+
+        #detects.append(detect)
         #----------------------------------------#
         #   获得预测框的左上角和右下角
         #----------------------------------------#
-        bboxes = torch.cat([xv_mask - half_w, yv_mask - half_h, xv_mask + half_w, yv_mask + half_h], dim=1)
-        bboxes[:, [0, 2]] /= output_w
-        bboxes[:, [1, 3]] /= output_h
+        # bboxes = torch.cat([xv_mask - half_w, yv_mask - half_h, xv_mask + half_w, yv_mask + half_h], dim=1)
+        # bboxes[:, [0, 2]] /= output_w
+        # bboxes[:, [1, 3]] /= output_h
 
-        if iou_map is not None:
-            iou_mask = iou_map[mask]   # shape [N_filtered]
-            # Combine with class confidence
-            final_conf = class_conf[mask] * iou_mask
-        else:
-            final_conf = class_conf[mask]
+        # if iou_map is not None:
+        #     iou_mask = iou_map[mask]   # shape [N_filtered]
+        #     # Combine with class confidence
+        #     final_conf = class_conf[mask] * iou_mask
+        # else:
+        #     final_conf = class_conf[mask]
 
-        detect = torch.cat([bboxes, torch.unsqueeze(final_conf,-1), torch.unsqueeze(class_pred[mask],-1).float()], dim=-1)
-        detects.append(detect)
+        # detect = torch.cat([bboxes, torch.unsqueeze(final_conf,-1), torch.unsqueeze(class_pred[mask],-1).float()], dim=-1)
+        # detects.append(detect)
 
     return detects
+
+def centernet_correct_boxes_xyxy(decoded_boxes, input_shape, image_shape, letterbox_image):
+    """
+    Adjusts bounding boxes predicted by decode_bbox to fit the original image shape.
+    
+    Args:
+        decoded_boxes (torch.Tensor): Tensor of shape (N, 4) with bounding boxes
+                                       in the format [x_min, y_min, x_max, y_max].
+        input_shape (tuple): Shape of the input image to the model (e.g., (512, 512)).
+        image_shape (tuple): Shape of the original image (e.g., (height, width)).
+        letterbox_image (bool): Whether letterboxing (padding) was applied during preprocessing.
+
+    Returns:
+        torch.Tensor: Adjusted bounding boxes in the same format as input.
+    """
+    input_shape = torch.tensor(input_shape, dtype=torch.float32)
+    image_shape = torch.tensor(image_shape, dtype=torch.float32)
+
+    decoded_boxes = decoded_boxes[0]
+    
+    if len(decoded_boxes) > 0:
+        if letterbox_image:
+            # Calculate scaling and offset for letterboxed image
+            new_shape = torch.round(image_shape * torch.min(input_shape / image_shape))
+            offset = (input_shape - new_shape) / 2. / input_shape
+            scale = input_shape / new_shape
+
+            # Adjust bounding boxes
+            decoded_boxes[:, 0] = (decoded_boxes[:, 0] / input_shape[1] - offset[1]) * scale[1]
+            decoded_boxes[:, 2] = (decoded_boxes[:, 2] / input_shape[1] - offset[1]) * scale[1]
+            decoded_boxes[:, 1] = (decoded_boxes[:, 1] / input_shape[0] - offset[0]) * scale[0]
+            decoded_boxes[:, 3] = (decoded_boxes[:, 3] / input_shape[0] - offset[0]) * scale[0]
+        else:
+            # Adjust bounding boxes directly for scaled images
+            decoded_boxes[:, 0] /= input_shape[1]
+            decoded_boxes[:, 2] /= input_shape[1]
+            decoded_boxes[:, 1] /= input_shape[0]
+            decoded_boxes[:, 3] /= input_shape[0]
+
+        # Scale back to original image shape
+        decoded_boxes[:, 0] *= image_shape[1]
+        decoded_boxes[:, 2] *= image_shape[1]
+        decoded_boxes[:, 1] *= image_shape[0]
+        decoded_boxes[:, 3] *= image_shape[0]
+
+        # Clip boxes to image boundaries
+        decoded_boxes[:, 0] = torch.clamp(decoded_boxes[:, 0], 0, image_shape[1])
+        decoded_boxes[:, 2] = torch.clamp(decoded_boxes[:, 2], 0, image_shape[1])
+        decoded_boxes[:, 1] = torch.clamp(decoded_boxes[:, 1], 0, image_shape[0])
+        decoded_boxes[:, 3] = torch.clamp(decoded_boxes[:, 3], 0, image_shape[0])
+    else:
+        decoded_boxes = torch.tensor(decoded_boxes)
+
+    return decoded_boxes
 
 def centernet_correct_boxes(box_xy, box_wh, input_shape, image_shape, letterbox_image):
     #-----------------------------------------------------------------#

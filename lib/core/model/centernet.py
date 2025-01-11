@@ -50,9 +50,9 @@ class CenterNetHead(nn.Module):
 
 
         self.cls =SeparableConv2d(head_dims[0], nc, kernel_size=3, stride=1, padding=1, bias=True)
-        self.wh =SeparableConv2d(head_dims[0], 2, kernel_size=3, stride=1, padding=1, bias=True)
-        self.offset =SeparableConv2d(head_dims[0], 2, kernel_size=3, stride=1, padding=1, bias=True)
-        self.iou_head = nn.Conv2d(head_dims[0], 1, kernel_size=3, stride=1, padding=1, bias=True)
+        self.wh =SeparableConv2d(head_dims[0], 4, kernel_size=3, stride=1, padding=1, bias=True)
+        # self.offset =SeparableConv2d(head_dims[0], 2, kernel_size=3, stride=1, padding=1, bias=True)
+        # self.iou_head = nn.Conv2d(head_dims[0], 1, kernel_size=3, stride=1, padding=1, bias=True)
 
         normal_init(self.cls.pointwise, 0, 0.01,-2.19)
         normal_init(self.wh.pointwise, 0, 0.01, 0)
@@ -64,11 +64,11 @@ class CenterNetHead(nn.Module):
 
         cls = self.cls(inputs).sigmoid_()
         wh = self.wh(inputs)
-        offset = self.offset(inputs)
-        iou_aware_head = self.iou_head(inputs).sigmoid_().squeeze(1) #[B, H, W]
+        # offset = self.offset(inputs)
+        # iou_aware_head = self.iou_head(inputs).sigmoid_().squeeze(1) #[B, H, W]
         
 
-        return cls, offset,wh,iou_aware_head
+        return cls,wh
 
 class CenterNet(nn.Module):
     def __init__(self,nc,inference=False,coreml=False ):
@@ -116,11 +116,11 @@ class CenterNet(nn.Module):
 
         fpn_fm=self.fpn(fms)
 
-        cls, wh,  offset,iou_aware_head = self.head(fpn_fm)
+        cls, wh = self.head(fpn_fm)
 
 
         if not self.inference:
-            return cls,wh*16 ,offset,iou_aware_head   #,angle
+            return cls,wh*16    #,angle
         else:
             detections = self.decode(cls, wh*16, self.down_ratio)
             return detections
