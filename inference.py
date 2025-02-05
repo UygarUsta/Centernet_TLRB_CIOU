@@ -140,6 +140,9 @@ if export_onnx:
     output_names=["output"],
     opset_version=11)
 
+if not cpu:
+    model.cuda()
+
 save_xml = False
 if save_xml :
     if not os.path.isdir(os.path.join(folder,"annos")):
