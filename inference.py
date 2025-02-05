@@ -128,8 +128,17 @@ if openvino_exp:
 
 if export_onnx:
     torch_input = torch.randn(1, 3, input_width, input_height)
-    onnx_program = torch.onnx.dynamo_export(model, torch_input)
+    full_model_path = os.path.join("./", "onnx_best_mbv2_ltrb_cocomini.onnx")
+    #onnx_program = torch.onnx.dynamo_export(model, torch_input)
     #onnx_program.save("mbv2_shufflenet_widerface.onnx")
+    torch.onnx.export(
+    model.cpu(),
+    torch_input,
+    full_model_path,
+    verbose=True,
+    input_names=["input"],
+    output_names=["output"],
+    opset_version=11)
 
 save_xml = False
 if save_xml :
