@@ -165,7 +165,11 @@ def infer_image_faster(model, img, classes, confidence=0.05, half=False, input_s
     # Inference
     with torch.no_grad():
         if not openvino_exp:
-            hm, wh = model(input_tensor.float())
+            if half:
+               input_tensor = input_tensor.half()
+            else:
+               input_tensor = input_tensor.float()
+            hm, wh = model(input_tensor)
         else:
             output = model(input_tensor)
             hm = torch.tensor(output[0])
