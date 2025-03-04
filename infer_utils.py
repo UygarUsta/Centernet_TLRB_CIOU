@@ -125,6 +125,82 @@ def infer_image(model,img,classes,confidence=0.05,half=False,input_shape = (512,
         #print(f"Could not infer an error occured: {e}")
 
     return image,box_annos
+
+
+def infer_image_faster(model, img, classes, confidence=0.05, half=False, input_shape=(512, 512), cpu=False, openvino_exp=False):
+    # Setup device once
+    if not openvino_exp:
+      device = torch.device("cpu" if cpu else "cuda")
+      cuda = True
+    else:
+       device = 'cpu'
+       cuda = False
+    #cuda = not cpu
+    
+    # Start timing only if needed
+    fps1 = time.time()
+    
+    # Efficient image loading
+    if isinstance(img, str):
+        image = cv2.imread(img)  # OpenCV is typically faster than PIL
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        image = np.array(img)
+    
+    image_shape = np.array(image.shape[0:2])
+    
+    # Simplify image preprocessing - use OpenCV resize directly which is usually faster
+    image_data = cv2.resize(image, tuple(input_shape), interpolation=cv2.INTER_LINEAR)
+    
+    # Vectorized preprocessing (avoid loops)
+    image_data = image_data.astype('float32')  # Assuming this is what preprocess_input does
+    image_data = preprocess_input(image_data)
+    image_data = image_data.transpose(2, 0, 1)[None]  # NHWC -> NCHW, add batch dimension
+    
+    # Use mixed precision consistently if enabled
+    input_tensor = torch.from_numpy(image_data).to(device)
+    if half:
+        input_tensor = input_tensor.half()
+    
+    # Inference
+    with torch.no_grad():
+        if not openvino_exp:
+            hm, wh = model(input_tensor.float())
+        else:
+            output = model(input_tensor)
+            hm = torch.tensor(output[0])
+            wh = torch.tensor(output[1])
+    
+    # Ensure outputs are on the correct device and type
+    if half:
+        hm = hm.half()
+        wh = wh.half()
+    
+    # Post-processing
+    outputs = decode_bbox(hm, wh, stride=4, confidence=confidence, cuda=cuda)
+    results = centernet_correct_boxes_xyxy(outputs, input_shape, image_shape, False).cpu()
+    
+    # Pre-compute drawing parameters
+    lf = max(round(sum(image_shape) / 2 * 0.003), 2)
+    tf = max(lf - 1, 1)
+    
+    box_annos = []
+    # Vectorize this if possible
+    for det in results:
+        xmin, ymin, xmax, ymax, conf, label = int(det[0]), int(det[1]), int(det[2]), int(det[3]), float(det[4]), int(det[5])
+        name = f'{classes[label]} {conf:.2f}'
+        box_annos.append([xmin, ymin, xmax, ymax, name, conf])
+        
+        # Draw only if needed (could make this optional)
+        cv2.rectangle(image, (xmin, ymin), (xmax, ymax), colors(label, True), lf)
+        cv2.putText(image, name, (xmin-3, ymin), cv2.FONT_HERSHEY_COMPLEX, 1, (255, 0, 255), 2)
+    
+    # Only calculate FPS if needed
+    fps2 = time.time()
+    fps = 1 / (fps2 - fps1)
+    cv2.putText(image, f'FPS:{fps:.2f}', (200, 100), cv2.FONT_HERSHEY_COMPLEX, 1, (255, 0, 255), 2)
+    
+    return image, box_annos
             
 def load_model(model,model_path):
     device = "cuda"
