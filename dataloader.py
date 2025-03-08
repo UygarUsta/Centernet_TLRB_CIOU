@@ -277,6 +277,290 @@ class CenternetDataset(Dataset):
         return image_data, box
 
 
+
+class CenternetDatasetMosaicAug(Dataset):
+    def __init__(self, image_path, input_shape,classes,num_classes, train):
+        super(CenternetDataset, self).__init__()
+        self.image_path = image_path
+        self.length             = len(self.image_path)
+
+        self.input_shape        = input_shape
+        self.output_shape       = (int(input_shape[0]/4) , int(input_shape[1]/4))
+        self.classes = classes
+        self.num_classes        = num_classes
+        self.train              = train
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        #index = index % self.length
+
+        #-------------------------------------------------#
+        #   进行数据增强
+        #-------------------------------------------------#
+        if self.train and np.random.rand() < 0.5:
+            # Apply mosaic augmentation
+            image, box = self.get_mosaic_data(index)
+        else:
+            # Load single image
+            image, box = self.get_random_data(self.image_path[index], self.input_shape, random=self.train)
+        #image, box      = self.get_random_data(self.image_path[index], self.input_shape, random = self.train)
+
+        batch_hm        = np.zeros((self.output_shape[0], self.output_shape[1], self.num_classes), dtype=np.float32)
+        #batch_wh        = np.zeros((self.output_shape[0], self.output_shape[1], 2), dtype=np.float32)
+        batch_reg       = np.zeros((self.output_shape[0], self.output_shape[1], 4), dtype=np.float32)
+        batch_reg_mask  = np.zeros((self.output_shape[0], self.output_shape[1]), dtype=np.float32)
+        neighbor_size = 1
+        if len(box) != 0:
+            boxes = np.array(box[:, :4],dtype=np.float32)
+            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]] / self.input_shape[1] * self.output_shape[1], 0, self.output_shape[1] - 1)
+            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]] / self.input_shape[0] * self.output_shape[0], 0, self.output_shape[0] - 1)
+        H, W = batch_hm.shape[:2]
+        for i in range(len(box)):
+            bbox    = boxes[i].copy()
+            cls_id  = int(box[i, -1])
+
+            h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+            if h > 0 and w > 0:
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
+                radius = max(0, int(radius))
+                #-------------------------------------------------#
+                #   计算真实框所属的特征点
+                #-------------------------------------------------#
+                ct = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
+                ct_int = ct.astype(np.int32)
+                xmin,ymin,xmax,ymax = bbox[:4]
+                area = (1 / self.bbox_areas_log_np(bbox[:4])) * 2
+                #----------------------------#
+                #   绘制高斯热力图
+                #----------------------------#
+                batch_hm[:, :, cls_id] = draw_gaussian(batch_hm[:, :, cls_id], ct_int, radius)
+                for dx in range(-neighbor_size, neighbor_size + 1):
+                    for dy in range(-neighbor_size, neighbor_size + 1):
+                        nx = ct_int[0] + dx
+                        ny = ct_int[1] + dy
+        
+                        if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                            continue
+
+                        adjusted_tlbr = [
+                            (nx - xmin),  # Distance from the grid cell to the left edge
+                            (ny - ymin),  # Distance from the grid cell to the top edge
+                            (xmax - nx),  # Distance from the grid cell to the right edge
+                            (ymax - ny)   # Distance from the grid cell to the bottom edge
+                        ]
+                        batch_reg[ny, nx] = adjusted_tlbr
+                        batch_hm[ny, nx, cls_id] = 1
+                        batch_reg_mask[ny, nx] = area
+
+        image = np.transpose(preprocess_input(image), (2, 0, 1))
+
+        return image, batch_hm, batch_reg, batch_reg_mask
+    
+    def get_mosaic_data(self, index):
+        """Mosaic augmentation: Combines 4 images into one."""
+        indices = [index] + [np.random.randint(0, self.length) for _ in range(3)]
+        images, all_boxes = [], []
+        for idx in indices:
+            img_path = self.image_path[idx]
+            img, box = self.get_random_data(
+                img_path,
+                input_shape=(self.input_shape[0] // 2, self.input_shape[1] // 2),
+                random=True
+            )
+            images.append(img)
+            all_boxes.append(box)
+
+        # Create mosaic image
+        mosaic_image = np.zeros((self.input_shape[0], self.input_shape[1], 3), dtype=np.uint8)
+        positions = [
+            (0, 0),
+            (self.input_shape[1] // 2, 0),
+            (0, self.input_shape[0] // 2),
+            (self.input_shape[1] // 2, self.input_shape[0] // 2)
+        ]
+        for i in range(4):
+            img = images[i]
+            x_offset, y_offset = positions[i]
+            h, w = img.shape[0], img.shape[1]
+            mosaic_image[y_offset:y_offset + h, x_offset:x_offset + w] = img
+
+        # Combine and adjust boxes
+        mosaic_boxes = []
+        for i in range(4):
+            boxes = all_boxes[i]
+            if len(boxes) == 0:
+                continue
+            boxes = boxes.copy()
+            x_off, y_off = positions[i]
+            boxes[:, [0, 2]] += x_off
+            boxes[:, [1, 3]] += y_off
+            mosaic_boxes.append(boxes)
+        mosaic_boxes = np.concatenate(mosaic_boxes, axis=0) if len(mosaic_boxes) > 0 else np.array([])
+
+        # Apply flip
+        if self.rand() < 0.5:
+            mosaic_image = mosaic_image[:, ::-1]
+            if len(mosaic_boxes) > 0:
+                mosaic_boxes[:, [0, 2]] = self.input_shape[1] - mosaic_boxes[:, [2, 0]]
+
+        # Apply color jitter
+        image_data = mosaic_image.astype(np.uint8)
+        r = np.random.uniform(-1, 1, 3) * [0.1, 0.7, 0.4] + 1
+        hue, sat, val = cv2.split(cv2.cvtColor(image_data, cv2.COLOR_RGB2HSV))
+        dtype = image_data.dtype
+        x = np.arange(0, 256, dtype=r.dtype)
+        lut_hue = ((x * r[0]) % 180).astype(dtype)
+        lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+        lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+        image_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+        image_data = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2RGB)
+
+        # Filter boxes
+        if len(mosaic_boxes) > 0:
+            mosaic_boxes[:, 0:2] = np.clip(mosaic_boxes[:, 0:2], 0, self.input_shape[1])
+            mosaic_boxes[:, 2] = np.clip(mosaic_boxes[:, 2], 0, self.input_shape[1])
+            mosaic_boxes[:, 3] = np.clip(mosaic_boxes[:, 3], 0, self.input_shape[0])
+            box_w = mosaic_boxes[:, 2] - mosaic_boxes[:, 0]
+            box_h = mosaic_boxes[:, 3] - mosaic_boxes[:, 1]
+            mosaic_boxes = mosaic_boxes[np.logical_and(box_w > 1, box_h > 1)]
+
+        return image_data, mosaic_boxes
+    
+    def bbox_areas_log_np(self,bbox):
+        x_min, y_min, x_max, y_max = bbox[0], bbox[1], bbox[2], bbox[3]
+        area = (y_max - y_min + 1) * (x_max - x_min + 1)
+        return np.log(area) 
+
+
+    def rand(self, a=0, b=1):
+        return np.random.rand()*(b-a) + a
+
+    def get_random_data(self, image_path, input_shape, jitter=.3, hue=.1, sat=0.7, val=0.4, random=True):
+        extension = os.path.splitext(image_path)[1]
+        #line    = annotation_line.split()
+        #------------------------------#
+        #   读取图像并转换成RGB图像
+        #------------------------------#
+        image   = Image.open(image_path)
+        image   = cvtColor(image)
+        #------------------------------#
+        #   获得图像的高宽与目标高宽
+        #------------------------------#
+        iw, ih  = image.size
+        h, w    = input_shape
+        #------------------------------#
+        #   获得预测框
+        #------------------------------#
+        if os.path.isfile(image_path.replace(extension,".xml")):
+            annotation_line = image_path.replace(extension,".xml")
+            box = extract_coordinates(annotation_line,self.classes)
+        else:
+            box = []
+        #box     = np.array([np.array(list(map(int,box.split(',')))) for box in line[1:]])
+
+        if not random:
+            scale = min(w/iw, h/ih)
+            nw = int(iw*scale)
+            nh = int(ih*scale)
+            dx = (w-nw)//2
+            dy = (h-nh)//2
+
+            #---------------------------------#
+            #   将图像多余的部分加上灰条
+            #---------------------------------#
+            image       = image.resize((nw,nh), Image.BICUBIC)
+            new_image   = Image.new('RGB', (w,h), (128,128,128))
+            new_image.paste(image, (dx, dy))
+            image_data  = np.array(new_image, np.float32)
+
+            #---------------------------------#
+            #   对真实框进行调整
+            #---------------------------------#
+            if len(box)>0:
+                box = np.array(box)
+                np.random.shuffle(box)
+                box[:, [0,2]] = box[:, [0,2]]*nw/iw + dx
+                box[:, [1,3]] = box[:, [1,3]]*nh/ih + dy
+                box[:, 0:2][box[:, 0:2]<0] = 0
+                box[:, 2][box[:, 2]>w] = w
+                box[:, 3][box[:, 3]>h] = h
+                box_w = box[:, 2] - box[:, 0]
+                box_h = box[:, 3] - box[:, 1]
+                box = box[np.logical_and(box_w>1, box_h>1)] # discard invalid box
+
+            return image_data, box
+                
+        #------------------------------------------#
+        #   对图像进行缩放并且进行长和宽的扭曲
+        #------------------------------------------#
+        new_ar = w/h * self.rand(1-jitter,1+jitter) / self.rand(1-jitter,1+jitter)
+        scale = self.rand(.25, 2)
+        if new_ar < 1:
+            nh = int(scale*h)
+            nw = int(nh*new_ar)
+        else:
+            nw = int(scale*w)
+            nh = int(nw/new_ar)
+        image = image.resize((nw,nh), Image.BICUBIC)
+
+        #------------------------------------------#
+        #   将图像多余的部分加上灰条
+        #------------------------------------------#
+        dx = int(self.rand(0, w-nw))
+        dy = int(self.rand(0, h-nh))
+        new_image = Image.new('RGB', (w,h), (128,128,128))
+        new_image.paste(image, (dx, dy))
+        image = new_image
+
+        #------------------------------------------#
+        #   翻转图像
+        #------------------------------------------#
+        flip = self.rand()<.5
+        if flip: image = image.transpose(Image.FLIP_LEFT_RIGHT)
+
+        image_data      = np.array(image, np.uint8)
+        #---------------------------------#
+        #   对图像进行色域变换
+        #   计算色域变换的参数
+        #---------------------------------#
+        r               = np.random.uniform(-1, 1, 3) * [hue, sat, val] + 1
+        #---------------------------------#
+        #   将图像转到HSV上
+        #---------------------------------#
+        hue, sat, val   = cv2.split(cv2.cvtColor(image_data, cv2.COLOR_RGB2HSV))
+        dtype           = image_data.dtype
+        #---------------------------------#
+        #   应用变换
+        #---------------------------------#
+        x       = np.arange(0, 256, dtype=r.dtype)
+        lut_hue = ((x * r[0]) % 180).astype(dtype)
+        lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+        lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+        image_data = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+        image_data = cv2.cvtColor(image_data, cv2.COLOR_HSV2RGB)
+
+        #---------------------------------#
+        #   对真实框进行调整
+        #---------------------------------#
+        if len(box)>0:
+            box = np.array(box)
+            np.random.shuffle(box)
+            box[:, [0,2]] = box[:, [0,2]]*nw/iw + dx
+            box[:, [1,3]] = box[:, [1,3]]*nh/ih + dy
+            if flip: box[:, [0,2]] = w - box[:, [2,0]]
+            box[:, 0:2][box[:, 0:2]<0] = 0
+            box[:, 2][box[:, 2]>w] = w
+            box[:, 3][box[:, 3]>h] = h
+            box_w = box[:, 2] - box[:, 0]
+            box_h = box[:, 3] - box[:, 1]
+            box = box[np.logical_and(box_w>1, box_h>1)] 
+        
+        return image_data, box
+
+
 class CenternetDatasetTTF(Dataset):
     def __init__(self, image_path, input_shape, classes, num_classes, train):
         super(CenternetDatasetTTF, self).__init__()
