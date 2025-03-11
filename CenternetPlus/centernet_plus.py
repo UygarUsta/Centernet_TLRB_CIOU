@@ -87,7 +87,7 @@ class CenterNetPlus(nn.Module):
 
         self.twth_pred = nn.Sequential(
             Conv(p2, 64, k=3, p=1, act=act),
-            nn.Conv2d(64, 2, kernel_size=1)
+            nn.Conv2d(64, 4, kernel_size=1)
         )
 
         # self.iou_aware_pred = nn.Sequential(
@@ -118,6 +118,6 @@ class CenterNetPlus(nn.Module):
 
         # detection head
         hm = self.cls_pred(p2).sigmoid_()
-        offset = self.txty_pred(p2)
+        #offset = self.txty_pred(p2)
         wh = self.twth_pred(p2)
-        return hm,wh,offset
+        return hm,wh #,offset
